@@ -10,7 +10,7 @@ import (
 
 	"github.com/hashicorp/terraform/helper/resource"
 	"github.com/hashicorp/terraform/helper/schema"
-	libvirt "github.com/libvirt/libvirt-go"
+	"github.com/libvirt/libvirt-go"
 	"github.com/libvirt/libvirt-go-xml"
 )
 
@@ -208,6 +208,22 @@ func resourceLibvirtNetwork() *schema.Resource {
 					},
 				},
 			},
+			"routes": {
+				Type:     schema.TypeList,
+				Optional: true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"cidr": {
+							Type:     schema.TypeString,
+							Required: true,
+						},
+						"gateway": {
+							Type:     schema.TypeString,
+							Required: true,
+						},
+					},
+				},
+			},
 			"xml": {
 				Type:     schema.TypeList,
 				Optional: true,
@@ -358,8 +374,8 @@ func resourceLibvirtNetworkCreate(d *schema.ResourceData, meta interface{}) erro
 		}
 
 		var dnsSRVs []libvirtxml.NetworkDNSSRV
-		if dnsSRVCount, ok := d.GetOk(dnsPrefix + ".srvs.#"); ok {
-			for i := 0; i < dnsSRVCount.(int); i++ {
+		if routesCount, ok := d.GetOk(dnsPrefix + ".srvs.#"); ok {
+			for i := 0; i < routesCount.(int); i++ {
 				srv := libvirtxml.NetworkDNSSRV{}
 				srvPrefix := fmt.Sprintf(dnsPrefix+".srvs.%d", i)
 				if service, ok := d.GetOk(srvPrefix + ".service"); ok {
@@ -409,7 +425,7 @@ func resourceLibvirtNetworkCreate(d *schema.ResourceData, meta interface{}) erro
 					return fmt.Errorf("Could not parse address '%s'", address)
 				}
 
-				dnsHostsMap[address] = append(dnsHostsMap[address], d.Get(hostPrefix+".hostname").(string))
+				dnsHostsMap[address] = append(dnsHostsMap[address], d.Get(hostPrefix + ".hostname").(string))
 			}
 		}
 
@@ -442,6 +458,50 @@ func resourceLibvirtNetworkCreate(d *schema.ResourceData, meta interface{}) erro
 		networkDef.Forward = nil
 	} else {
 		return fmt.Errorf("unsupported network mode '%s'", networkDef.Forward.Mode)
+	}
+
+	// parse any static routes
+	var routes []libvirtxml.NetworkRoute
+	if routesCount, ok := d.GetOk("routes.#"); ok {
+		log.Printf("[INFO] %d routes defined", routesCount)
+		for i := 0; i < routesCount.(int); i++ {
+			route := libvirtxml.NetworkRoute{}
+			routePrefix := fmt.Sprintf("routes.%d", i)
+
+			if cidr, ok := d.GetOk(routePrefix + ".cidr"); ok {
+				addr, net, err := net.ParseCIDR(cidr.(string))
+				if err != nil {
+					return fmt.Errorf("Error parsing static route in network: %s", err)
+				}
+
+				if addr.To4() == nil {
+					route.Family = "ipv6"
+				}
+
+				route.Address = addr.String()
+
+				ones, _ := net.Mask.Size()
+				route.Prefix = (uint)(ones)
+			} else {
+				return fmt.Errorf("no address defined for static route")
+			}
+
+			if gw, ok := d.GetOk(routePrefix + ".gateway"); ok {
+				ip := net.ParseIP(gw.(string))
+				if ip == nil {
+					return fmt.Errorf("Error parsing IP '%s' in static route in network", gw)
+				}
+				route.Gateway = ip.String()
+			} else {
+				return fmt.Errorf("no gateway defined for static route")
+			}
+
+			routes = append(routes, route)
+		}
+
+		networkDef.Routes = routes
+	} else {
+		log.Printf("[INFO] No routes defined")
 	}
 
 	// once we have the network defined, connect to libvirt and create it from the XML serialization
@@ -573,6 +633,17 @@ func resourceLibvirtNetworkRead(d *schema.ResourceData, meta interface{}) error 
 			}
 		}
 	}
+
+	if len(networkDef.Routes) > 0 {
+		for i, route := range networkDef.Routes {
+			routePrefix := fmt.Sprintf("routes.%d", i)
+			d.Set(routePrefix+".gateway", route.Gateway)
+
+			cidr := fmt.Sprintf("%s/%d", route.Address, route.Prefix)
+			d.Set(routePrefix+".cidr", cidr)
+		}
+	}
+
 	// TODO: get any other parameters from the network and save them
 
 	log.Printf("[DEBUG] Network ID %s successfully read", d.Id())
